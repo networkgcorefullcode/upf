@@ -1,0 +1,238 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2020-present Open Networking Foundation
+# Taskfile equivalent to UPF Makefile
+
+version: '3'
+
+vars:
+  PROJECT_NAME: upf-epc
+  VERSION:
+    sh: cat ./VERSION 2>/dev/null || echo "latest"
+  OSTYPE:
+    sh: uname -s
+  NPROCS:
+    sh: |
+      case "{{.OSTYPE}}" in
+        Linux)
+          nproc
+          ;;
+        Darwin)
+          sysctl -n hw.physicalcpu
+          ;;
+        *)
+          echo 1
+          ;;
+      esac
+  CPU: native
+  ENABLE_NTF: 0
+  
+  # Docker related
+  DOCKER_REGISTRY: ""
+  DOCKER_REPOSITORY: ""
+  DOCKER_TAG: "{{.VERSION}}"
+  DOCKER_IMAGENAME: "{{.DOCKER_REGISTRY}}{{.DOCKER_REPOSITORY}}{{.PROJECT_NAME}}:{{.DOCKER_TAG}}"
+  DOCKER_BUILDKIT: 1
+  DOCKER_BUILD_ARGS: "--build-arg MAKEFLAGS=-j{{.NPROCS}} --build-arg CPU={{.CPU}} --build-arg ENABLE_NTF={{.ENABLE_NTF}}"
+  DOCKER_PULL: "--pull"
+  
+  # Docker labels
+  DOCKER_LABEL_VCS_URL:
+    sh: git remote get-url $(git remote) 2>/dev/null || echo "unknown"
+  DOCKER_LABEL_VCS_REF:
+    sh: |
+      if git diff-index --quiet HEAD -- 2>/dev/null; then
+        git rev-parse HEAD 2>/dev/null || echo "unknown"
+      else
+        echo "unknown"
+      fi
+  DOCKER_LABEL_COMMIT_DATE:
+    sh: |
+      if git diff-index --quiet HEAD -- 2>/dev/null; then
+        git show -s --format=%cd --date=iso-strict HEAD 2>/dev/null || echo "unknown"
+      else
+        echo "unknown"
+      fi
+  DOCKER_LABEL_BUILD_DATE:
+    sh: date -u "+%Y-%m-%dT%H:%M:%SZ"
+  
+  DOCKER_TARGETS: "bess pfcpiface"
+  BESS_PB_DIR: pfcpiface
+  PTF_PB_DIR: ptf/lib
+
+tasks:
+  # Main Docker build task
+  docker-build:
+    desc: "Build Docker images for UPF components"
+    cmds:
+      - task: _build-target
+        vars: {TARGET: bess}
+      - task: _build-target
+        vars: {TARGET: pfcpiface}
+
+  # Helper task to build individual targets
+  _build-target:
+    internal: true
+    vars:
+      DOCKER_CACHE_ARG:
+        sh: |
+          if [ "{{.DOCKER_BUILDKIT}}" = "1" ]; then
+            echo "--cache-from {{.DOCKER_REGISTRY}}{{.DOCKER_REPOSITORY}}upf-epc-{{.TARGET}}:{{.DOCKER_TAG}}"
+          else
+            echo ""
+          fi
+    cmds:
+      - |
+        DOCKER_BUILDKIT={{.DOCKER_BUILDKIT}} docker build {{.DOCKER_PULL}} {{.DOCKER_BUILD_ARGS}} \
+          --target {{.TARGET}} \
+          {{.DOCKER_CACHE_ARG}} \
+          --tag {{.DOCKER_REGISTRY}}{{.DOCKER_REPOSITORY}}upf-epc-{{.TARGET}}:{{.DOCKER_TAG}} \
+          --label org.opencontainers.image.source="https://github.com/omec-project/upf-epc" \
+          --label org.label.schema.version="{{.VERSION}}" \
+          --label org.label.schema.vcs.url="{{.DOCKER_LABEL_VCS_URL}}" \
+          --label org.label.schema.vcs.ref="{{.DOCKER_LABEL_VCS_REF}}" \
+          --label org.label.schema.build.date="{{.DOCKER_LABEL_BUILD_DATE}}" \
+          --label org.opencord.vcs.commit.date="{{.DOCKER_LABEL_COMMIT_DATE}}" \
+          .
+
+  # Push Docker images
+  docker-push:
+    desc: "Push Docker images to registry"
+    deps: [docker-build]
+    cmds:
+      - docker push {{.DOCKER_REGISTRY}}{{.DOCKER_REPOSITORY}}upf-epc-bess:{{.DOCKER_TAG}}
+      - docker push {{.DOCKER_REGISTRY}}{{.DOCKER_REPOSITORY}}upf-epc-pfcpiface:{{.DOCKER_TAG}}
+
+  # Extract build artifacts
+  output:
+    desc: "Extract build artifacts from Docker build"
+    cmds:
+      - |
+        DOCKER_BUILDKIT={{.DOCKER_BUILDKIT}} docker build {{.DOCKER_PULL}} {{.DOCKER_BUILD_ARGS}} \
+          --target artifacts \
+          --output type=tar,dest=output.tar \
+          .
+      - rm -rf output
+      - mkdir output
+      - tar -xf output.tar -C output
+      - rm -f output.tar
+
+  # Testing tasks
+  test-up4-integration-docker:
+    desc: "Run UP4 integration tests with Docker"
+    vars:
+      TEST_DOCKER_TARGETS: pfcpiface
+      TEST_DOCKER_TAG: integration
+    cmds:
+      - task: _build-target
+        vars: 
+          TARGET: pfcpiface
+          DOCKER_TAG: "{{.TEST_DOCKER_TAG}}"
+      - docker rm -f mock-up4 pfcpiface || true
+      - docker network prune -f
+      - |
+        MODE=docker DATAPATH=up4 go test -v -count=1 -failfast -timeout 15m ./test/integration/...
+
+  test-bess-integration-native:
+    desc: "Run BESS integration tests natively"
+    cmds:
+      - |
+        MODE=native DATAPATH=bess go test \
+          -v \
+          -race \
+          -count=1 \
+          -failfast \
+          ./test/integration/...
+
+  test:
+    desc: "Run unit tests with coverage"
+    deps: [_coverage-dir]
+    cmds:
+      - |
+        docker run --rm -v {{.PWD}}:/upf-epc -w /upf-epc golang:latest \
+          go test \
+            -race \
+            -failfast \
+            -coverprofile=.coverage/coverage-unit.txt \
+            -covermode=atomic \
+            -v \
+            ./pfcpiface ./cmd/...
+
+  _coverage-dir:
+    internal: true
+    cmds:
+      - rm -rf .coverage
+      - mkdir -p .coverage
+
+  # Protocol buffer generation
+  pb:
+    desc: "Generate Go protobuf files"
+    cmds:
+      - |
+        DOCKER_BUILDKIT={{.DOCKER_BUILDKIT}} docker build {{.DOCKER_PULL}} {{.DOCKER_BUILD_ARGS}} \
+          --target pb \
+          --output output \
+          .
+      - cp -a output/bess_pb {{.BESS_PB_DIR}}
+
+  py-pb:
+    desc: "Generate Python protobuf files"
+    cmds:
+      - |
+        DOCKER_BUILDKIT={{.DOCKER_BUILDKIT}} docker build {{.DOCKER_PULL}} {{.DOCKER_BUILD_ARGS}} \
+          --target ptf-pb \
+          --output output \
+          .
+      - cp -a output/bess_pb/. {{.PTF_PB_DIR}}
+
+  # P4 constants generation
+  p4-constants:
+    desc: "Generate P4 constants for Go"
+    cmds:
+      - echo "*** Generating go constants..."
+      - |
+        docker run --rm -v {{.PWD}}:/app -w /app \
+          golang:latest go run ./cmd/p4info_code_gen/p4info_code_gen.go \
+          -output internal/p4constants/p4constants.go -p4info conf/p4/bin/p4info.txt
+      - |
+        docker run --rm -v {{.PWD}}:/app -w /app \
+          golang:latest gofmt -w internal/p4constants/p4constants.go
+
+  # Code formatting and linting
+  fmt:
+    desc: "Format Go code"
+    cmds:
+      - go fmt ./...
+
+  golint:
+    desc: "Run Go linter"
+    cmds:
+      - |
+        docker run --rm -v {{.PWD}}:/app -w /app/pfcpiface \
+          golangci/golangci-lint:latest golangci-lint run -v --config /app/.golangci.yml
+
+  check-reuse:
+    desc: "Check REUSE compliance"
+    cmds:
+      - |
+        docker run --rm -v {{.PWD}}:/upf-epc -w /upf-epc \
+          omecproject/reuse-verify:latest reuse lint
+
+  # Convenience tasks
+  build:
+    desc: "Build all components"
+    deps: [docker-build]
+
+  clean:
+    desc: "Clean build artifacts"
+    cmds:
+      - rm -rf output output.tar .coverage
+      - docker system prune -f
+
+  all:
+    desc: "Run all checks and builds"
+    deps: [fmt, golint, check-reuse, docker-build, test]
+
+  help:
+    desc: "Show available tasks"
+    cmds:
+      - task --list
