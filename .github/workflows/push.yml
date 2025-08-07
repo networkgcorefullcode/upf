@@ -19,6 +19,7 @@ jobs:
       branch_name: ${{ github.ref }}
       changed: ${{ needs.tag-github.outputs.changed }}
       version: ${{ needs.tag-github.outputs.version }}
+      docker_repository: "network5gcore/"
     secrets: inherit
 
   update-version:
