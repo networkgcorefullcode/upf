@@ -21,8 +21,8 @@ CPU                      ?= native
 ENABLE_NTF               ?= 0
 
 ## Docker related
-DOCKER_REGISTRY          ?=
-DOCKER_REPOSITORY        ?=
+DOCKER_REGISTRY          ?= 192.168.12.15:8083/
+DOCKER_REPOSITORY        ?= omecproject/
 DOCKER_TAG               ?= ${VERSION}
 DOCKER_IMAGENAME         := ${DOCKER_REGISTRY}${DOCKER_REPOSITORY}${PROJECT_NAME}:${DOCKER_TAG}
 DOCKER_BUILDKIT          ?= 1
